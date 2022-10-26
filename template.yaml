@@ -1,0 +1,1193 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: v0.1.0
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: DEV
+    AllowedValues:
+      - DEV
+      - QA
+      - PROD
+
+  FirstLambdaBaseUrl:
+    Type: String
+    Default: ''
+
+  FirstLambdaClientIdSSMParamName:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: ''
+
+  ThirdLambdaApiKeySSMParamName:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: ''
+
+  KeyArn:
+    Type: String
+    Default: ''
+
+  AllowedIPsOrCIDRs:
+    Type: CommaDelimitedList
+    Default: ''
+
+  ApiLoggingLevel:
+    Type: String
+    Default: 'OFF'
+    AllowedValues:
+      - 'OFF'
+      - INFO
+      - ERROR
+  
+  CloudWatchMetricsForApiEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  DataTraceForApiEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+      
+  AccessLogFormat:
+    Type: String
+    Default: >
+      $context.identity.sourceIp
+      $context.identity.caller
+      $context.identity.user
+      [$context.requestTime]
+      "$context.httpMethod $context.resourcePath $context.protocol"
+      $context.status
+      $context.responseLength
+      $context.requestId
+
+
+
+Mappings:
+  #------------------- Global properties --------------------#
+  Global:
+    Constants:
+      ApplicationName: ServerlessApp
+
+  #------------------- App-specific properties --------------------#
+  LambdasProperties:
+    LiveAlias:
+      Name: live
+    Configuration:
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 3
+      Runtime: nodejs12.x
+      NameSuffix: Configuration
+    FirstLambda:
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 10
+      Runtime: nodejs12.x
+      NameSuffix: FirstLambda
+    SecondLambda:
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 3
+      Runtime: nodejs12.x
+      NameSuffix: SecondLambda
+    ThirdLambda:
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 10
+      Runtime: nodejs12.x
+      NameSuffix: ThirdLambda
+    Version:
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 3
+      Runtime: nodejs12.x
+      NameSuffix: Version
+    FourthLambda:
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 3
+      Runtime: nodejs12.x
+      NameSuffix: FourthLambda
+
+  DynamoDBProperties:
+    Configuration:
+      BillingMode: PAY_PER_REQUEST
+    SecondLambda:
+      BillingMode: PAY_PER_REQUEST
+    Auth:
+      BillingMode: PAY_PER_REQUEST
+
+  RestApi:
+    Properties:
+      ApiKeySourceType: HEADER
+      Types: EDGE
+    Stage:
+      Name: v1
+  
+  Logging:
+    AccessLogRetentionInDays:
+      DEV: 30
+      QA: 90
+      PROD: 365
+
+  
+  Code:
+    Mock:
+      Source: |
+        'use strict';
+
+        const BODY = 'Service is currently unable to handle the request due to a maintenance.'
+
+        exports.handler = async function(event, context) {
+            console.log("REQUEST RECEIVED:\n" + JSON.stringify(event))
+            
+            // LIVE alias must NOT point to the $LATEST where this particular sources might be stored.
+            // Returning constantly 503 response to prevent such cases.
+            // The assumption is that the issue will be detected on monitoring level.
+            let response = {
+              statusCode: 503,
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(BODY)
+            };
+            
+            return response;
+        }
+
+  #------------------- AWS basic statements --------------------#
+  ApiMethodsIntegration:
+    Lambda:
+      IntegrationHttpMethod: POST
+      Type: AWS_PROXY
+  # Permissions:
+  #   ApiInvokesLambda:
+  #     Action: lambda:InvokeFunction
+  #     Principal: apigateway.amazonaws.com
+  IAM:
+    ApiGatewayPushToCloudWatchLogs:
+      Arn: arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+    BasicExecutionRole: 
+      Arn: arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+    LambdaTraceToXRay:
+      Arn: arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+    InlinePolicy:
+      Name: inline-policy
+  Outputs:
+    Lambda:
+      LogGroupPrefix: /aws/lambda
+
+
+
+Resources:
+  #-----------------#
+  # DynamoDB tables #
+  #-----------------#
+  ConfigurationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions: 
+        -
+          AttributeName: type
+          AttributeType: S
+      BillingMode: !FindInMap [DynamoDBProperties, Configuration, BillingMode]
+      KeySchema:
+        -
+          AttributeName: type
+          KeyType: HASH
+      Tags: 
+        - { Key: application_name, Value: !FindInMap [Global, Constants, ApplicationName] }
+        - { Key: environment_name, Value: !Ref EnvironmentName }
+
+  SecondLambdaTable:
+    Type: AWS::DynamoDB::Table
+    Properties: 
+      AttributeDefinitions: 
+        -
+          AttributeName: token
+          AttributeType: S
+      BillingMode: !FindInMap [DynamoDBProperties, SecondLambda, BillingMode]
+      KeySchema: 
+        -
+          AttributeName: token
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expires
+        Enabled: true
+      Tags: 
+        - { Key: application_name, Value: !FindInMap [Global, Constants, ApplicationName] }
+        - { Key: environment_name, Value: !Ref EnvironmentName }
+
+  AuthTable:
+    Type: AWS::DynamoDB::Table
+    Properties: 
+      AttributeDefinitions: 
+        -
+          AttributeName: token
+          AttributeType: S
+      BillingMode: !FindInMap [DynamoDBProperties, Auth, BillingMode]
+      KeySchema: 
+        -
+          AttributeName: token
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expires
+        Enabled: true
+      Tags: 
+        - { Key: application_name, Value: !FindInMap [Global, Constants, ApplicationName] }
+        - { Key: environment_name, Value: !Ref EnvironmentName }
+
+  #------------------------------------#
+  # Lambda (Functions + Execution role #
+  #------------------------------------#
+
+  #------------------- Configuration Lambda --------------------#
+  ConfigurationExecutionRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        -
+          Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns: 
+        - !FindInMap [IAM, BasicExecutionRole, Arn]
+        - !FindInMap [IAM, LambdaTraceToXRay, Arn]
+      Policies: 
+        - 
+          PolicyName: !FindInMap [IAM, InlinePolicy, Name]
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+            -
+              Effect: Allow
+              Action:
+              - dynamodb:GetItem
+              Resource:
+              - !GetAtt ConfigurationTable.Arn
+
+  ConfigurationFunction: 
+    Type: AWS::Lambda::Function
+    Properties: 
+      Handler: !FindInMap [LambdasProperties, Configuration, Handler]
+      Runtime: !FindInMap [LambdasProperties, Configuration, Runtime]
+      MemorySize: !FindInMap [LambdasProperties, Configuration, MemorySize]
+      Timeout: !FindInMap [LambdasProperties, Configuration, Timeout]
+      Role: !GetAtt ConfigurationExecutionRole.Arn
+      TracingConfig:
+        Mode: Active
+      FunctionName:
+        Fn::Sub:
+        - ${AppName}-${EnvironmentName}-${Suffix}
+        - AppName: !FindInMap [Global, Constants, ApplicationName]
+          Suffix: !FindInMap [LambdasProperties, Configuration, NameSuffix]
+      Code: 
+        ZipFile: !FindInMap [Code, Mock, Source]
+      Environment:
+        Variables:
+          TABLE_CONFIGURATION: !Ref ConfigurationTable
+      Tags: 
+        - { Key: application_name, Value: !FindInMap [Global, Constants, ApplicationName] }
+        - { Key: environment_name, Value: !Ref EnvironmentName }
+   
+ 
+  #------------------- FirstLambda Lambda --------------------#
+  FirstLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        -
+          Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns: 
+        - !FindInMap [IAM, BasicExecutionRole, Arn]
+        - !FindInMap [IAM, LambdaTraceToXRay, Arn]
+      Policies: 
+        - 
+          PolicyName: !FindInMap [IAM, InlinePolicy, Name]
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+            -
+              Effect: Allow
+              Action:
+              - dynamodb:PutItem
+              Resource:
+              - !GetAtt SecondLambdaTable.Arn
+            -
+              Effect: Allow
+              Action:
+              - dynamodb:GetItem
+              Resource:
+              - !GetAtt AuthTable.Arn
+            -
+              Effect: Allow
+              Action:
+              - dynamodb:UpdateItem
+              Resource:
+              - !GetAtt AuthTable.Arn
+            -
+              Effect: Allow
+              Action:
+              - kms:Decrypt
+              Resource: 
+              - !Ref KeyArn
+
+  FirstLambdaFunction: 
+    Type: AWS::Lambda::Function
+    Properties: 
+      Handler: !FindInMap [LambdasProperties, FirstLambda, Handler]
+      Runtime: !FindInMap [LambdasProperties, FirstLambda, Runtime]
+      MemorySize: !FindInMap [LambdasProperties, FirstLambda, MemorySize]
+      Timeout: !FindInMap [LambdasProperties, FirstLambda, Timeout]
+      Role: !GetAtt FirstLambdaExecutionRole.Arn
+      TracingConfig:
+        Mode: Active      
+      FunctionName:
+        Fn::Sub:
+        - ${AppName}-${EnvironmentName}-${Suffix}
+        - AppName: !FindInMap [Global, Constants, ApplicationName]
+          Suffix: !FindInMap [LambdasProperties, FirstLambda, NameSuffix]
+      Code: 
+        ZipFile: !FindInMap [Code, Mock, Source]
+      Environment:
+        Variables:
+          FirstLambda_BASE_URL: !Ref FirstLambdaBaseUrl
+          FirstLambda_CLIENT_ID: !Ref FirstLambdaClientIdSSMParamName
+          API_ENV: !Ref EnvironmentName
+          TABLE_FirstLambda_AUTH: !Ref SecondLambdaTable
+          TABLE_AUTH: !Ref AuthTable
+      Tags: 
+        - { Key: application_name, Value: !FindInMap [Global, Constants, ApplicationName] }
+        - { Key: environment_name, Value: !Ref EnvironmentName }
+
+
+
+  #------------------- SecondLambda Lambda --------------------#
+  SecondLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        -
+          Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns: 
+        - !FindInMap [IAM, BasicExecutionRole, Arn]
+        - !FindInMap [IAM, LambdaTraceToXRay, Arn]
+      Policies: 
+        - 
+          PolicyName: !FindInMap [IAM, InlinePolicy, Name]
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+            -
+              Effect: Allow
+              Action:
+              - dynamodb:GetItem
+              Resource:
+              - !GetAtt SecondLambdaTable.Arn
+            -
+              Effect: Allow
+              Action:
+              - kms:Decrypt
+              Resource: 
+              - !Ref KeyArn
+
+  SecondLambdaFunction: 
+    Type: AWS::Lambda::Function
+    Properties: 
+      Handler: !FindInMap [LambdasProperties, SecondLambda, Handler]
+      Runtime: !FindInMap [LambdasProperties, SecondLambda, Runtime]
+      MemorySize: !FindInMap [LambdasProperties, SecondLambda, MemorySize]
+      Timeout: !FindInMap [LambdasProperties, SecondLambda, Timeout]
+      Role: !GetAtt SecondLambdaExecutionRole.Arn
+      TracingConfig:
+        Mode: Active      
+      FunctionName:
+        Fn::Sub:
+        - ${AppName}-${EnvironmentName}-${Suffix}
+        - AppName: !FindInMap [Global, Constants, ApplicationName]
+          Suffix: !FindInMap [LambdasProperties, SecondLambda, NameSuffix]
+      Code: 
+        ZipFile: !FindInMap [Code, Mock, Source]
+      Environment:
+        Variables:
+          FirstLambda_CLIENT_ID: !Ref FirstLambdaClientIdSSMParamName
+          API_ENV: !Ref EnvironmentName
+          TABLE_FirstLambda_AUTH: !Ref SecondLambdaTable
+      Tags: 
+        - { Key: application_name, Value: !FindInMap [Global, Constants, ApplicationName] }
+        - { Key: environment_name, Value: !Ref EnvironmentName }
+  
+
+  #------------------- ThirdLambda Lambda --------------------#
+  ThirdLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        -
+          Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+        - !FindInMap [IAM, BasicExecutionRole, Arn]
+        - !FindInMap [IAM, LambdaTraceToXRay, Arn]
+      Policies: 
+        - 
+          PolicyName: !FindInMap [IAM, InlinePolicy, Name]
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+            -
+              Effect: Allow
+              Action:
+              - dynamodb:GetItem
+              Resource:
+              - !GetAtt AuthTable.Arn
+            -
+              Effect: Allow
+              Action:
+              - dynamodb:UpdateItem
+              Resource:
+              - !GetAtt AuthTable.Arn
+            -
+              Effect: Allow
+              Action:
+              - kms:Decrypt
+              Resource: 
+              - !Ref KeyArn
+
+  ThirdLambdaFunction: 
+    Type: AWS::Lambda::Function
+    Properties: 
+      Handler: !FindInMap [LambdasProperties, ThirdLambda, Handler]
+      Runtime: !FindInMap [LambdasProperties, ThirdLambda, Runtime]
+      MemorySize: !FindInMap [LambdasProperties, ThirdLambda, MemorySize]
+      Timeout: !FindInMap [LambdasProperties, ThirdLambda, Timeout]
+      Role: !GetAtt ThirdLambdaExecutionRole.Arn
+      TracingConfig:
+        Mode: Active      
+      FunctionName:
+        Fn::Sub:
+        - ${AppName}-${EnvironmentName}-${Suffix}
+        - AppName: !FindInMap [Global, Constants, ApplicationName]
+          Suffix: !FindInMap [LambdasProperties, ThirdLambda, NameSuffix]
+      Code: 
+        ZipFile: !FindInMap [Code, Mock, Source]
+      Environment:
+        Variables:
+          ThirdLambda_API_KEY: !Ref ThirdLambdaApiKeySSMParamName
+          TABLE_AUTH: !Ref AuthTable
+          API_ENV: !Ref EnvironmentName
+      Tags: 
+        - { Key: application_name, Value: !FindInMap [Global, Constants, ApplicationName] }
+        - { Key: environment_name, Value: !Ref EnvironmentName }
+
+
+  #------------------- FourthLambda Lambda --------------------#
+  FourthLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        -
+          Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns: 
+        - !FindInMap [IAM, BasicExecutionRole, Arn]
+        - !FindInMap [IAM, LambdaTraceToXRay, Arn]
+      Policies: 
+        - 
+          PolicyName: !FindInMap [IAM, InlinePolicy, Name]
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+            -
+              Effect: Allow
+              Action:
+              - dynamodb:PutItem
+              Resource:
+              - !GetAtt AuthTable.Arn
+
+  FourthLambdaFunction: 
+    Type: AWS::Lambda::Function
+    Properties: 
+      Handler: !FindInMap [LambdasProperties, FourthLambda, Handler]
+      Runtime: !FindInMap [LambdasProperties, FourthLambda, Runtime]
+      MemorySize: !FindInMap [LambdasProperties, FourthLambda, MemorySize]
+      Timeout: !FindInMap [LambdasProperties, FourthLambda, Timeout]
+      Role: !GetAtt FourthLambdaExecutionRole.Arn
+      TracingConfig:
+        Mode: Active      
+      FunctionName:
+        Fn::Sub:
+        - ${AppName}-${EnvironmentName}-${Suffix}
+        - AppName: !FindInMap [Global, Constants, ApplicationName]
+          Suffix: !FindInMap [LambdasProperties, FourthLambda, NameSuffix]
+      Code: 
+        ZipFile: !FindInMap [Code, Mock, Source]
+      Environment:
+        Variables:
+          API_ENV: !Ref EnvironmentName
+          TABLE_AUTH: !Ref AuthTable
+      Tags: 
+        - { Key: application_name, Value: !FindInMap [Global, Constants, ApplicationName] }
+        - { Key: environment_name, Value: !Ref EnvironmentName }
+
+#------------------- Version Lambda --------------------#
+  VersionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        -
+          Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns: 
+        - !FindInMap [IAM, BasicExecutionRole, Arn]
+        - !FindInMap [IAM, LambdaTraceToXRay, Arn]
+      Policies: 
+        - 
+          PolicyName: !FindInMap [IAM, InlinePolicy, Name]
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+            -
+              Effect: Allow
+              Action:
+              - lambda:GetAlias
+              Resource:
+              - '*'
+
+  VersionFunction: 
+    Type: AWS::Lambda::Function
+    Properties: 
+      Handler: !FindInMap [LambdasProperties, Version, Handler]
+      Runtime: !FindInMap [LambdasProperties, Version, Runtime]
+      MemorySize: !FindInMap [LambdasProperties, Version, MemorySize]
+      Timeout: !FindInMap [LambdasProperties, Version, Timeout]
+      Role: !GetAtt VersionExecutionRole.Arn
+      TracingConfig:
+        Mode: Active      
+      FunctionName:
+        Fn::Sub:
+        - ${AppName}-${EnvironmentName}-${Suffix}
+        - AppName: !FindInMap [Global, Constants, ApplicationName]
+          Suffix: !FindInMap [LambdasProperties, Version, NameSuffix]
+      Code: 
+        ZipFile: !FindInMap [Code, Mock, Source]
+      Environment:
+        Variables:
+          FUNCTION_NAMES:
+            !Join 
+            - ','
+            - - !Ref ConfigurationFunction
+              - !Ref FirstLambdaFunction
+              - !Ref SecondLambdaFunction
+              - !Ref ThirdLambdaFunction
+              - !Ref FourthLambdaFunction
+              - Fn::Sub:
+                - ${AppName}-${EnvironmentName}-${Suffix}
+                - AppName: !FindInMap [Global, Constants, ApplicationName]
+                  Suffix: !FindInMap [LambdasProperties, Version, NameSuffix]
+      Tags: 
+        - { Key: application_name, Value: !FindInMap [Global, Constants, ApplicationName] }
+        - { Key: environment_name, Value: !Ref EnvironmentName }
+   
+
+  #-------------------------------------------------------------------#
+  # API Gateway (REST API + Resources + Methods + Stage + Deployment) #
+  #-------------------------------------------------------------------#
+  ApiGatewayRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      ApiKeySourceType: !FindInMap [RestApi, Properties, ApiKeySourceType]
+      Description:
+        Fn::Sub:
+        - REST API for ${AppName} application from ${EnvironmentName} environment
+        - AppName: !FindInMap [Global, Constants, ApplicationName]
+      EndpointConfiguration:
+        Types: 
+        - !FindInMap [RestApi, Properties, Types]
+      Name:
+        Fn::Sub:
+        - ${AppName}-${EnvironmentName}
+        - AppName: !FindInMap [Global, Constants, ApplicationName]
+      Policy: # NOTE: If you change the resource policy, make sure to redeploy your API. (cloudformation.sh will do it automatically)
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": "*",
+              "Action": "execute-api:Invoke",
+              "Resource": !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:*" # '*' is wildcard for Stage name
+            },
+            {
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": "execute-api:Invoke",
+              "Resource": !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:*/POST/app/auth/", # '*' is wildcard for Stage name
+              "Condition": {
+                "NotIpAddress": {
+                  "aws:SourceIp": !Ref AllowedIPsOrCIDRs
+                }
+              }
+            }
+          ]
+        }
+      Tags: 
+        - { Key: application_name, Value: !FindInMap [Global, Constants, ApplicationName] }
+        - { Key: environment_name, Value: !Ref EnvironmentName }
+    
+  #------------------- API Gateway logging --------------------#
+  ApiLoggingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Push logs to CloudWatch logs from API Gateway
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        -
+          Effect: Allow
+          Principal:
+            Service:
+            - apigateway.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns: 
+        - !FindInMap [IAM, ApiGatewayPushToCloudWatchLogs, Arn]
+
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties: 
+      CloudWatchRoleArn: !GetAtt ApiLoggingRole.Arn
+    DependsOn:
+      - ApiGatewayRestApi
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub:
+        - /aws/apigateway/AccessLog-${AppName}-${EnvironmentName}
+        - AppName: !FindInMap [Global, Constants, ApplicationName]
+      RetentionInDays: !FindInMap [Logging, AccessLogRetentionInDays, !Ref EnvironmentName]
+
+  #------------------- Global subpaths --------------------#
+  ThirdLabmdaResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: 
+      ParentId: !GetAtt ApiGatewayRestApi.RootResourceId
+      PathPart: app
+      RestApiId: !Ref ApiGatewayRestApi
+
+  SecondResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: 
+      ParentId: !Ref ThirdLabmdaResource
+      PathPart: auth
+      RestApiId: !Ref ApiGatewayRestApi
+
+  FirstLambdaResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: 
+      ParentId: !Ref ThirdLabmdaResource
+      PathPart: FirstLambda
+      RestApiId: !Ref ApiGatewayRestApi
+
+  #------------------- SecondLambda subpath --------------------#
+  AuthResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: 
+      ParentId: !Ref FirstLambdaResource
+      PathPart: auth
+      RestApiId: !Ref ApiGatewayRestApi
+  
+  ValidateResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: 
+      ParentId: !Ref AuthResource
+      PathPart: validate
+      RestApiId: !Ref ApiGatewayRestApi
+
+  ValidateGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: GET
+      AuthorizationType: NONE
+      ResourceId: !Ref ValidateResource
+      RestApiId: !Ref ApiGatewayRestApi
+      Integration:
+        IntegrationHttpMethod: !FindInMap [ApiMethodsIntegration, Lambda, IntegrationHttpMethod]
+        Type: !FindInMap [ApiMethodsIntegration, Lambda, Type]
+        Uri:
+          Fn::Sub:
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SecondLambdaFunction.Arn}:${Alias}/invocations
+          - Alias: !FindInMap [LambdasProperties, LiveAlias, Name]
+
+  ValidateOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      ResourceId: !Ref ValidateResource
+      RestApiId: !Ref ApiGatewayRestApi
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+        - 
+          StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,X-Forwarded-For'"
+            method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+          ResponseTemplates:
+            application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+      -
+        StatusCode: '200'
+        ResponseModels:
+          application/json: Empty
+        ResponseParameters:
+          method.response.header.Access-Control-Allow-Headers: false
+          method.response.header.Access-Control-Allow-Methods: false
+          method.response.header.Access-Control-Allow-Origin: false
+
+#------------------- FourthLambda subpath --------------------#          
+  OneMoreResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: 
+      ParentId: !Ref SecondResource
+      PathPart: resource
+      RestApiId: !Ref ApiGatewayRestApi
+
+  OneMorePostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ResourceId: !Ref OneMoreResource
+      RestApiId: !Ref ApiGatewayRestApi
+      Integration:
+        IntegrationHttpMethod: !FindInMap [ApiMethodsIntegration, Lambda, IntegrationHttpMethod]
+        Type: !FindInMap [ApiMethodsIntegration, Lambda, Type]
+        Uri:
+          Fn::Sub:
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FourthLambdaFunction.Arn}:${Alias}/invocations
+          - Alias: !FindInMap [LambdasProperties, LiveAlias, Name]
+
+  #------------------- Configuration subpath --------------------#     
+  ConfigurationResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: 
+      ParentId: !Ref ThirdLabmdaResource
+      PathPart: configuration
+      RestApiId: !Ref ApiGatewayRestApi
+
+  ConfigurationTypeResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: 
+      ParentId: !Ref ConfigurationResource
+      PathPart: '{type}'
+      RestApiId: !Ref ApiGatewayRestApi
+
+  ConfigurationTypeGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: GET
+      AuthorizationType: NONE
+      ResourceId: !Ref ConfigurationTypeResource
+      RestApiId: !Ref ApiGatewayRestApi
+      Integration:
+        IntegrationHttpMethod: !FindInMap [ApiMethodsIntegration, Lambda, IntegrationHttpMethod]
+        Type: !FindInMap [ApiMethodsIntegration, Lambda, Type]
+        Uri:
+          Fn::Sub:
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ConfigurationFunction.Arn}:${Alias}/invocations
+          - Alias: !FindInMap [LambdasProperties, LiveAlias, Name]
+
+  ConfigurationTypeOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      ResourceId: !Ref ConfigurationTypeResource
+      RestApiId: !Ref ApiGatewayRestApi
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+        - 
+          StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,X-Forwarded-For'"
+            method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+          ResponseTemplates:
+            application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+      -
+        StatusCode: '200'
+        ResponseModels:
+          application/json: Empty
+        ResponseParameters:
+          method.response.header.Access-Control-Allow-Headers: false
+          method.response.header.Access-Control-Allow-Methods: false
+          method.response.header.Access-Control-Allow-Origin: false
+
+  #------------------- FirstLambda subpath --------------------#
+  FirstLambdaSearchResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: 
+      ParentId: !Ref FirstLambdaResource
+      PathPart: search
+      RestApiId: !Ref ApiGatewayRestApi
+
+  FirstLambdaSearchResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: 
+      ParentId: !Ref FirstLambdaSearchResource
+      PathPart: '{}'
+      RestApiId: !Ref ApiGatewayRestApi
+
+  FirstLambdaSearchGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: GET
+      AuthorizationType: NONE
+      ResourceId: !Ref FirstLambdaSearchResource
+      RestApiId: !Ref ApiGatewayRestApi
+      Integration:
+        IntegrationHttpMethod: !FindInMap [ApiMethodsIntegration, Lambda, IntegrationHttpMethod]
+        Type: !FindInMap [ApiMethodsIntegration, Lambda, Type]
+        Uri:
+          Fn::Sub:
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FirstLambdaFunction.Arn}:${Alias}/invocations
+          - Alias: !FindInMap [LambdasProperties, LiveAlias, Name]
+
+  FirstLambdaSearchOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      ResourceId: !Ref FirstLambdaSearchResource
+      RestApiId: !Ref ApiGatewayRestApi
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+        - 
+          StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,X-Forwarded-For'"
+            method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+          ResponseTemplates:
+            application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+      -
+        StatusCode: '200'
+        ResponseModels:
+          application/json: Empty
+        ResponseParameters:
+          method.response.header.Access-Control-Allow-Headers: false
+          method.response.header.Access-Control-Allow-Methods: false
+          method.response.header.Access-Control-Allow-Origin: false
+
+  #------------------- ThirdLambda subpath --------------------#
+  ThirdLambdaResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: 
+      ParentId: !Ref ThirdLabmdaResource
+      PathPart: ThirdLambda
+      RestApiId: !Ref ApiGatewayRestApi
+
+  ThirdLambdaSearchResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: 
+      ParentId: !Ref ThirdLambdaResource
+      PathPart: search
+      RestApiId: !Ref ApiGatewayRestApi
+
+  ThirdLambdaSearchResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: 
+      ParentId: !Ref ThirdLambdaSearchResource
+      PathPart: '{}'
+      RestApiId: !Ref ApiGatewayRestApi
+
+  ThirdLambdaSearchGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: GET
+      AuthorizationType: NONE
+      ResourceId: !Ref ThirdLambdaSearchResource
+      RestApiId: !Ref ApiGatewayRestApi
+      Integration:
+        IntegrationHttpMethod: !FindInMap [ApiMethodsIntegration, Lambda, IntegrationHttpMethod]
+        Type: !FindInMap [ApiMethodsIntegration, Lambda, Type]
+        Uri:
+          Fn::Sub:
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ThirdLambdaFunction.Arn}:${Alias}/invocations
+          - Alias: !FindInMap [LambdasProperties, LiveAlias, Name]
+
+  ThirdLambdaSearchOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      ResourceId: !Ref ThirdLambdaSearchResource
+      RestApiId: !Ref ApiGatewayRestApi
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+        - 
+          StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,X-Forwarded-For'"
+            method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+          ResponseTemplates:
+            application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+      -
+        StatusCode: '200'
+        ResponseModels:
+          application/json: Empty
+        ResponseParameters:
+          method.response.header.Access-Control-Allow-Headers: false
+          method.response.header.Access-Control-Allow-Methods: false
+          method.response.header.Access-Control-Allow-Origin: false
+ 
+  #------------------- Version subpath --------------------#
+  VersionResource:
+    Type: AWS::ApiGateway::Resource
+    Properties: 
+      ParentId: !Ref ThirdLabmdaResource
+      PathPart: version
+      RestApiId: !Ref ApiGatewayRestApi
+
+  VersionGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: GET
+      AuthorizationType: NONE
+      ResourceId: !Ref VersionResource
+      RestApiId: !Ref ApiGatewayRestApi
+      Integration:
+        IntegrationHttpMethod: !FindInMap [ApiMethodsIntegration, Lambda, IntegrationHttpMethod]
+        Type: !FindInMap [ApiMethodsIntegration, Lambda, Type]
+        Uri:
+          Fn::Sub:
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${VersionFunction.Arn}:${Alias}/invocations
+          - Alias: !FindInMap [LambdasProperties, LiveAlias, Name]
+
+  VersionOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      ResourceId: !Ref VersionResource
+      RestApiId: !Ref ApiGatewayRestApi
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+        - 
+          StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token,X-Forwarded-For'"
+            method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+          ResponseTemplates:
+            application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+      -
+        StatusCode: '200'
+        ResponseModels:
+          application/json: Empty
+        ResponseParameters:
+          method.response.header.Access-Control-Allow-Headers: false
+          method.response.header.Access-Control-Allow-Methods: false
+          method.response.header.Access-Control-Allow-Origin: false
+
+  #------------------- Stage & Deployment --------------------#
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+    DependsOn:
+      - ConfigurationTypeGetMethod
+      - FirstLambdaSearchGetMethod
+      - ValidateGetMethod
+      - ThirdLambdaSearchGetMethod
+      - ValidateOptionsMethod
+      - ConfigurationTypeOptionsMethod
+      - FirstLambdaSearchOptionsMethod
+      - ThirdLambdaSearchOptionsMethod
+      - VersionGetMethod
+      - VersionOptionsMethod
+      - OneMorePostMethod
+
+  Stage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName: !FindInMap [RestApi, Stage, Name]
+      RestApiId: !Ref ApiGatewayRestApi
+      DeploymentId: !Ref ApiGatewayDeployment
+      TracingEnabled: true
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: !Ref AccessLogFormat
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          MetricsEnabled: !Ref CloudWatchMetricsForApiEnabled
+          DataTraceEnabled: !Ref DataTraceForApiEnabled
+          LoggingLevel: !Ref ApiLoggingLevel
+
+
+
+Outputs:
+  AccountId:
+    Value: !Sub ${AWS::AccountId}
+
+  RestApiId:
+    Value: !Ref ApiGatewayRestApi
+  StageName:
+    Value: !FindInMap [RestApi, Stage, Name]
+  ApiGatewayUrl:
+    Value:
+      Fn::Sub:
+      - https://${ApiGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}
+      - StageName: !FindInMap [RestApi, Stage, Name]
+  AccessLogCloudWatchLogGroup:
+    Value: !Ref ApiAccessLogGroup
+
+  ConfigurationPath:
+    Value: app/configuration/*
+  FirstLambdaPath:
+    Value: app/FirstLambda/search/* 
+  SecondLambdaPath:
+    Value: app/FirstLambda/auth/validate
+  ThirdLambdaPath:
+    Value: app/ThirdLambda/search/*
+  VersionPath:
+    Value: app/version
+  FourthLambdaPath:
+    Value: app/auth/resource
+
+  ConfigurationFunctionArn:
+    Value: !GetAtt ConfigurationFunction.Arn
+  FirstLambdaFunctionArn:
+    Value: !GetAtt FirstLambdaFunction.Arn
+  SecondLambdaFunctionArn:
+    Value: !GetAtt SecondLambdaFunction.Arn
+  ThirdLambdaFunctionArn:
+    Value: !GetAtt ThirdLambdaFunction.Arn
+  VersionFunctionArn:
+    Value: !GetAtt VersionFunction.Arn
+  ConfigurationFunctionName:
+    Value: !Ref ConfigurationFunction
+  FirstLambdaFunctionName:
+    Value: !Ref FirstLambdaFunction
+  SecondLambdaFunctionName:
+    Value: !Ref SecondLambdaFunction
+  ThirdLambdaFunctionName:
+    Value: !Ref ThirdLambdaFunction
+  VersionFunctionName:
+    Value: !Ref VersionFunction
+  FourthLambdaFunctionName:
+    Value: !Ref FourthLambdaFunction
+  ConfigurationTableName:
+    Value: !Ref ConfigurationTable
+  SecondLambdaTableName:
+    Value: !Ref SecondLambdaTable
+  AuthTableName:
+    Value: !Ref AuthTable
+  
+  ConfigurationCloudWatchLogGroup:
+    Description: Logs are generated only after you run your function for the first time
+    Value: 
+      Fn::Sub:
+      - ${LogGroupPrefix}/${ConfigurationFunction}
+      - LogGroupPrefix: !FindInMap [Outputs, Lambda, LogGroupPrefix]
+  FirstLambdaCloudWatchLogGroup:
+    Description: Logs are generated only after you run your function for the first time
+    Value: 
+      Fn::Sub:
+      - ${LogGroupPrefix}/${FirstLambdaFunction}
+      - LogGroupPrefix: !FindInMap [Outputs, Lambda, LogGroupPrefix]
+  SecondLambdaCloudWatchLogGroup:
+    Description: Logs are generated only after you run your function for the first time
+    Value: 
+      Fn::Sub:
+      - ${LogGroupPrefix}/${SecondLambdaFunction}
+      - LogGroupPrefix: !FindInMap [Outputs, Lambda, LogGroupPrefix]
+  ThirdLambdaCloudWatchLogGroup:
+    Description: Logs are generated only after you run your function for the first time
+    Value: 
+      Fn::Sub:
+      - ${LogGroupPrefix}/${ThirdLambdaFunction}
+      - LogGroupPrefix: !FindInMap [Outputs, Lambda, LogGroupPrefix]
+  VersionCloudWatchLogGroup:
+    Description: Logs are generated only after you run your function for the first time
+    Value: 
+      Fn::Sub:
+      - ${LogGroupPrefix}/${VersionFunction}
+      - LogGroupPrefix: !FindInMap [Outputs, Lambda, LogGroupPrefix]
+  FourthLambdaCloudWatchLogGroup:
+    Description: Logs are generated only after you run your function for the first time
+    Value: 
+      Fn::Sub:
+      - ${LogGroupPrefix}/${FourthLambdaFunction}
+      - LogGroupPrefix: !FindInMap [Outputs, Lambda, LogGroupPrefix]
