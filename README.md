@@ -1,5 +1,5 @@
 # **Introduction**
-This repository contains information about TermFinderAPI infrastructure state described as a code, and some additional scripts/utils.
+This repository contains information about AppCode infrastructure state described as a code, and some additional scripts/utils.
 
 - - - -
 
